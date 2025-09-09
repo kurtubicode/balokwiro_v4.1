@@ -105,7 +105,9 @@ if ($result) {
                                                 <td><?php echo htmlspecialchars(ucfirst($pesanan['metode_pembayaran'])); ?></td>
                                                 <td><?php echo htmlspecialchars($pesanan['nama_kasir']); ?></td>
                                                 <td>
-                                                    <a href="detail_pesanan.php?id=<?php echo $pesanan['id_pesanan']; ?>" class="btn btn-info btn-sm">
+                                                    <a href="struk.php?id=<?php echo $pesanan['id_pesanan']; ?>" class="btn btn-info btn-sm">
+                                                    <!-- <a href="../../api/api_get_detail_pesanan.php?id=<?php echo $pesanan['id_pesanan']; ?>" class="btn btn-info btn-sm"> -->
+
                                                         <i class="fas fa-search"></i> Detail
                                                     </a>
                                                 </td>

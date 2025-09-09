@@ -2,19 +2,18 @@
 session_start();
 include '../../koneksi.php';
 
-// 1. OTENTIKASI & OTORISASI (Tidak ada perubahan)
+// 1. OTENTIKASI & OTORISASI
 if (!isset($_SESSION['user']) || $_SESSION['user']['jabatan'] !== 'kasir') {
     header('Location: ../../login.php');
     exit;
 }
 
-// 2. LOGIKA PROSES PESANAN (DISESUAIKAN DENGAN LOG_STOK)
+// 2. LOGIKA PROSES PESANAN
 if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['cart_data'])) {
     $id_karyawan_session = $_SESSION['user']['id'];
     $nama_pemesan = $_POST['nama_pemesan'] ?: 'Walk-in';
     $jenis_pesanan_form = $_POST['jenis_pesanan']; // 'dine_in' atau 'take_away'
     $metode_pembayaran = $_POST['metode_pembayaran'];
-    $total_amount = filter_var($_POST['total_amount'], FILTER_VALIDATE_FLOAT);
     $catatan = $_POST['catatan'] ?? '';
     $cart_data = json_decode($_POST['cart_data'], true);
 
@@ -23,7 +22,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['cart_data'])) {
     } else {
         mysqli_begin_transaction($koneksi);
         try {
-            // === PERUBAHAN 1: VALIDASI STOK DENGAN SISTEM LOG_STOK ===
+            // === VALIDASI STOK DENGAN SISTEM LOG_STOK ===
             $produk_info_map = []; // Untuk menyimpan info produk yang sudah divalidasi
             $stmt_produk_info = mysqli_prepare($koneksi, "SELECT id_produk, nama_produk, harga, status_produk, id_kategori_stok FROM produk WHERE id_produk = ?");
             $stmt_cek_stok_kategori = mysqli_prepare($koneksi, "SELECT SUM(jumlah_perubahan) as total FROM log_stok WHERE id_kategori_stok = ?");
@@ -57,27 +56,62 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['cart_data'])) {
                 $produk_info_map[$id] = $produk_db; // Simpan info jika valid
             }
 
-            // Logika "Beban Dapur" (tetap sama, sudah baik)
+            // === PERUBAHAN UTAMA: RE-KALKULASI TOTAL HARGA & DISKON DI BACKEND ===
+            $total_harga_sebelum_diskon = 0;
+            $total_kue_balok = 0;
+
+            foreach ($cart_data as $id => $item) {
+                // Re-hitung total harga dari database, bukan dari frontend
+                $total_harga_sebelum_diskon += $produk_info_map[$id]['harga'] * $item['quantity'];
+
+                // Identifikasi jumlah kue balok (Asumsi ID dimulai dengan 'KB')
+                if (strpos($id, 'KB') === 0) {
+                    $total_kue_balok += $item['quantity'];
+                }
+            }
+
+            // Terapkan logika diskon
+            // Terapkan logika diskon dengan kelipatan
+            $diskon = 0;
+
+            // Cek jika jumlah tepat 5
+            if ($total_kue_balok === 5) {
+                $diskon = 2000;
+            }
+            // Cek jika jumlah 10 atau kelipatan 10
+            else if ($total_kue_balok > 0 && ($total_kue_balok % 10) === 0) {
+                $jumlah_porsi_10 = $total_kue_balok / 10;
+                $diskon = $jumlah_porsi_10 * 5000;
+            }
+
+            $total_harga_final = $total_harga_sebelum_diskon - $diskon;
+
+            // PENTING: Gunakan total_harga_final ini, bukan yang dikirim dari frontend
+            $total_amount_yang_dipakai = $total_harga_final;
+
+            // PENTING: Gunakan total_harga_final ini, bukan yang dikirim dari frontend
+            $total_amount_yang_dipakai = $total_harga_final;
+            // Logika "Beban Dapur" (tetap sama)
             $sql_beban = "SELECT SUM(dp.jumlah) AS total_item_aktif FROM detail_pesanan dp JOIN pesanan p ON dp.id_pesanan = p.id_pesanan WHERE p.status_pesanan IN ('pending', 'diproses') AND (dp.id_produk LIKE 'KB%' OR dp.id_produk LIKE 'KS%')";
             $result_beban = mysqli_query($koneksi, $sql_beban);
             $beban_dapur = mysqli_fetch_assoc($result_beban)['total_item_aktif'] ?? 0;
             $status_awal = ($beban_dapur < 50) ? 'diproses' : 'pending';
 
-            // Insert ke tabel pesanan (tetap sama, sudah baik)
+            // Insert ke tabel pesanan (Gunakan total harga yang sudah divalidasi dan didiskon)
             $id_pesanan_baru = "KSR-" . date("YmdHis");
             $tgl_pesanan = date("Y-m-d H:i:s");
             $tipe_pesanan_baru = 'kasir';
             $stmt_pesanan = mysqli_prepare($koneksi, "INSERT INTO pesanan (id_pesanan, id_karyawan, tipe_pesanan, jenis_pesanan, nama_pemesan, tgl_pesanan, total_harga, metode_pembayaran, status_pesanan, catatan) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
-            mysqli_stmt_bind_param($stmt_pesanan, "sissssdsss", $id_pesanan_baru, $id_karyawan_session, $tipe_pesanan_baru, $jenis_pesanan_form, $nama_pemesan, $tgl_pesanan, $total_amount, $metode_pembayaran, $status_awal, $catatan);
+            mysqli_stmt_bind_param($stmt_pesanan, "sissssdsss", $id_pesanan_baru, $id_karyawan_session, $tipe_pesanan_baru, $jenis_pesanan_form, $nama_pemesan, $tgl_pesanan, $total_harga_final, $metode_pembayaran, $status_awal, $catatan);
             mysqli_stmt_execute($stmt_pesanan);
 
-            // === PERUBAHAN 2: PENGURANGAN STOK DENGAN INSERT KE LOG_STOK ===
+            // === PENGURANGAN STOK DENGAN INSERT KE LOG_STOK ===
             $stmt_detail = mysqli_prepare($koneksi, "INSERT INTO detail_pesanan (id_pesanan, id_produk, jumlah, harga_saat_transaksi, sub_total) VALUES (?, ?, ?, ?, ?)");
             $stmt_log = mysqli_prepare($koneksi, "INSERT INTO log_stok (id_produk, id_kategori_stok, jumlah_perubahan, jenis_aksi, id_pesanan, keterangan) VALUES (?, ?, ?, 'penjualan', ?, ?)");
 
             foreach ($cart_data as $id => $item) {
                 // 1. Insert ke detail pesanan
-                $harga_saat_ini = $item['price'];
+                $harga_saat_ini = $produk_info_map[$id]['harga'];
                 $sub_total = $harga_saat_ini * $item['quantity'];
                 mysqli_stmt_bind_param($stmt_detail, "ssidd", $id_pesanan_baru, $id, $item['quantity'], $harga_saat_ini, $sub_total);
                 mysqli_stmt_execute($stmt_detail);
@@ -98,7 +132,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['cart_data'])) {
             }
 
             mysqli_commit($koneksi);
-            $pesan_sukses = "Transaksi berhasil disimpan dengan ID: $id_pesanan_baru. <a href='detail_pesanan.php?id=$id_pesanan_baru' target='_blank' class='btn btn-sm btn-info ms-2 fw-bold'><i class='fas fa-print'></i> Cetak Struk</a>";
+            $pesan_sukses = "Transaksi berhasil disimpan dengan ID: $id_pesanan_baru. <a href='struk.php?id=$id_pesanan_baru' target='_blank' class='btn btn-sm btn-info ms-2 fw-bold'><i class='fas fa-print'></i> Cetak Struk</a>";
             $clear_cart_js = "<script>localStorage.removeItem('kasir_cart');</script>";
         } catch (Exception $e) {
             mysqli_rollback($koneksi);
@@ -108,7 +142,7 @@ if ($_SERVER["REQUEST_METHOD"] == "POST" && isset($_POST['cart_data'])) {
 }
 
 
-// 3. LOGIKA PENGAMBILAN DATA PRODUK DAN STOK (DISESUAIKAN DENGAN LOG_STOK)
+// 3. LOGIKA PENGAMBILAN DATA PRODUK DAN STOK
 $stok_terkini = [];
 $query_stok = "
     SELECT id_produk, NULL as id_kategori_stok, SUM(jumlah_perubahan) as total FROM log_stok WHERE id_produk IS NOT NULL GROUP BY id_produk
@@ -130,7 +164,6 @@ $query_produk = "SELECT id_produk, nama_produk, harga, poto_produk, kategori, id
                  WHERE status_produk = 'aktif' 
                  ORDER BY kategori ASC, nama_produk ASC";
 $result_produk = $koneksi->query($query_produk);
-
 ?>
 <!DOCTYPE html>
 <html lang="id">
@@ -207,6 +240,20 @@ $result_produk = $koneksi->query($query_produk);
 
                     <div class="row">
                         <div class="col-md-8 daftar-menu-scrollable">
+                            <div class="row mb-4">
+                                <div class="col-12">
+                                    <div class="card bg-light">
+                                        <div class="card-body">
+                                            <h5 class="card-title">Pilih Porsi untuk Kue Balok</h5>
+                                            <p class="card-text text-muted">Klik salah satu porsi, lalu pilih varian Kue Balok.</p>
+                                            <button type="button" class="btn btn-outline-primary btn-porsi" data-porsi="5">Setengah Porsi (5)</button>
+                                            <button type="button" class="btn btn-outline-primary btn-porsi" data-porsi="10">Satu Porsi (10)</button>
+                                            <button type="button" class="btn btn-outline-secondary ms-2" id="reset-porsi">Reset</button>
+                                            <div class="mt-2" id="info-porsi-terpilih"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
                             <div class="row">
                                 <?php
                                 if ($result_produk && $result_produk->num_rows > 0) {
@@ -313,7 +360,11 @@ $result_produk = $koneksi->query($query_produk);
 
     <script>
         document.addEventListener('DOMContentLoaded', function() {
+            // Definisi variabel global
             let cart = {};
+            let selectedPortion = null; // Menyimpan pilihan porsi (5 atau 10)
+
+            // Referensi elemen-elemen DOM
             const cartItemsDiv = document.getElementById('cart-items');
             const totalDisplay = document.getElementById('total-display');
             const chargeBtn = document.getElementById('charge-btn');
@@ -321,14 +372,17 @@ $result_produk = $koneksi->query($query_produk);
             const totalAmountInput = document.getElementById('total-amount-input');
             const emptyCartMessage = document.getElementById('empty-cart-message');
 
+            // Fungsi untuk memformat angka menjadi format mata uang
             function numberFormat(amount) {
                 return new Intl.NumberFormat('id-ID').format(amount);
             }
 
+            // Fungsi untuk menyimpan data keranjang ke Local Storage
             function saveCartToLocalStorage() {
                 localStorage.setItem('kasir_cart', JSON.stringify(cart));
             }
 
+            // Fungsi untuk memuat data keranjang dari Local Storage
             function loadCartFromLocalStorage() {
                 const storedCart = localStorage.getItem('kasir_cart');
                 if (storedCart) {
@@ -336,9 +390,14 @@ $result_produk = $koneksi->query($query_produk);
                 }
             }
 
+            // Fungsi utama untuk memperbarui tampilan keranjang dan menghitung total
             function updateCartDisplay() {
                 cartItemsDiv.innerHTML = '';
                 let total = 0;
+                let totalKueBalok = 0;
+                let totalNonKueBalok = 0;
+                let diskon = 0;
+
                 const hasItems = Object.keys(cart).length > 0;
 
                 if (hasItems) {
@@ -347,51 +406,107 @@ $result_produk = $koneksi->query($query_produk);
                         const item = cart[productId];
                         const itemSubtotal = item.price * item.quantity;
                         total += itemSubtotal;
+
+                        // Hitung total jumlah kue balok dan item non-kue balok
+                        if (productId.startsWith('KB')) {
+                            totalKueBalok += item.quantity;
+                        } else {
+                            totalNonKueBalok += item.quantity;
+                        }
+
                         const itemHtml = `
-                        <div class="d-flex justify-content-between align-items-center mb-2 cart-item-row" data-product-id="${productId}">
-                            <div>
-                                <strong class="d-block">${item.name}</strong>
-                                <div class="input-group input-group-sm mt-1" style="width: 120px;">
-                                    <button class="btn btn-outline-secondary minus-btn" type="button">-</button>
-                                    <input type="text" class="form-control text-center quantity-input" value="${item.quantity}" readonly>
-                                    <button class="btn btn-outline-secondary plus-btn" type="button">+</button>
-                                </div>
+                    <div class="d-flex justify-content-between align-items-center mb-2 cart-item-row" data-product-id="${productId}">
+                        <div>
+                            <strong class="d-block">${item.name}</strong>
+                            <div class="input-group input-group-sm mt-1" style="width: 120px;">
+                                <button class="btn btn-outline-secondary minus-btn" type="button">-</button>
+                                <input type="text" class="form-control text-center quantity-input" value="${item.quantity}" readonly>
+                                <button class="btn btn-outline-secondary plus-btn" type="button">+</button>
                             </div>
-                            <div class="text-end">
-                                <span class="d-block">Rp ${numberFormat(itemSubtotal)}</span>
-                                <button class="btn btn-sm btn-link text-danger remove-item-btn p-0">Hapus</button>
-                            </div>
-                        </div>`;
+                        </div>
+                        <div class="text-end">
+                            <span class="d-block">Rp ${numberFormat(itemSubtotal)}</span>
+                            <button class="btn btn-sm btn-link text-danger remove-item-btn p-0">Hapus</button>
+                        </div>
+                    </div>`;
                         cartItemsDiv.innerHTML += itemHtml;
                     }
+
+                    // Tentukan diskon berdasarkan total kue balok
+                    // Logika diskon kelipatan porsi
+                    if (totalKueBalok === 5) {
+                        // Jika jumlah tepat 5
+                        diskon = 2000;
+                    } else if (totalKueBalok > 0 && (totalKueBalok % 10) === 0) {
+                        // Jika jumlah 10 atau kelipatan 10 (contoh: 10, 20, 30, dst.)
+                        let jumlahPorsi10 = totalKueBalok / 10;
+                        diskon = jumlahPorsi10 * 5000;
+                    } else {
+                        // Untuk jumlah selain 5, 10, dan kelipatan 10 (contoh: 15, 25, 30), tidak ada diskon
+                        diskon = 0;
+                    }
+
+                    // Tampilkan diskon di keranjang jika ada
+                    if (diskon > 0) {
+                        cartItemsDiv.innerHTML += `
+                    <div class="d-flex justify-content-between text-success mt-2 fw-bold">
+                        <span>Diskon Porsi:</span>
+                        <span>- Rp ${numberFormat(diskon)}</span>
+                    </div>
+                `;
+                    }
                 } else {
+                    cartItemsDiv.innerHTML = '';
                     cartItemsDiv.appendChild(emptyCartMessage);
                     emptyCartMessage.style.display = 'block';
                 }
 
-                totalDisplay.textContent = 'Rp ' + numberFormat(total);
-                chargeBtn.disabled = !hasItems;
+                const totalFinal = total - diskon;
+                totalDisplay.textContent = 'Rp ' + numberFormat(totalFinal);
+
+                // Logika validasi tombol "Bayar"
+                // Tombol akan nonaktif jika keranjang kosong ATAU jika
+                // total kue balok kurang dari 5 DAN tidak ada item lain di keranjang.
+                if (!hasItems || (totalKueBalok < 5 && totalNonKueBalok === 0)) {
+                    chargeBtn.disabled = true;
+                } else {
+                    chargeBtn.disabled = false;
+                }
+
                 cartDataInput.value = JSON.stringify(cart);
-                totalAmountInput.value = total;
+                totalAmountInput.value = totalFinal;
                 saveCartToLocalStorage();
             }
 
+            // Fungsi untuk menambah produk ke keranjang
             function addToCart(card) {
                 const productId = card.dataset.productId;
                 const stock = parseInt(card.dataset.productStock);
+                const productName = card.dataset.productName;
+                const productPrice = parseInt(card.dataset.productPrice);
+                const isKueBalok = productId.startsWith('KB');
+
+                let quantityToAdd = 1;
+                // Logika baru: Jika porsi dipilih dan produknya adalah Kue Balok
+                if (selectedPortion !== null && isKueBalok) {
+                    quantityToAdd = selectedPortion;
+                    selectedPortion = null;
+                    document.querySelectorAll('.btn-porsi').forEach(btn => btn.classList.remove('active', 'btn-primary'));
+                    document.getElementById('info-porsi-terpilih').innerHTML = '';
+                }
 
                 if (cart[productId]) {
-                    if (cart[productId].quantity < stock) {
-                        cart[productId].quantity++;
+                    if (cart[productId].quantity + quantityToAdd <= stock) {
+                        cart[productId].quantity += quantityToAdd;
                     } else {
                         alert('Stok tidak mencukupi!');
                     }
                 } else {
-                    if (stock > 0) {
+                    if (stock >= quantityToAdd) {
                         cart[productId] = {
-                            name: card.dataset.productName,
-                            price: parseInt(card.dataset.productPrice),
-                            quantity: 1,
+                            name: productName,
+                            price: productPrice,
+                            quantity: quantityToAdd,
                             stock: stock
                         };
                     } else {
@@ -401,6 +516,26 @@ $result_produk = $koneksi->query($query_produk);
                 updateCartDisplay();
             }
 
+            // Event listener untuk tombol porsi
+            document.querySelectorAll('.btn-porsi').forEach(button => {
+                button.addEventListener('click', function() {
+                    document.querySelectorAll('.btn-porsi').forEach(btn => btn.classList.remove('active', 'btn-primary'));
+                    this.classList.add('active', 'btn-primary');
+                    selectedPortion = parseInt(this.dataset.porsi);
+                    document.getElementById('info-porsi-terpilih').innerHTML = `
+                <span class="badge bg-success">Porsi ${selectedPortion} Kue Balok dipilih. Pilih produk Kue Balok sekarang.</span>
+            `;
+                });
+            });
+
+            // Event listener untuk tombol reset porsi
+            document.getElementById('reset-porsi').addEventListener('click', function() {
+                document.querySelectorAll('.btn-porsi').forEach(btn => btn.classList.remove('active', 'btn-primary'));
+                selectedPortion = null;
+                document.getElementById('info-porsi-terpilih').innerHTML = '';
+            });
+
+            // Event listener untuk klik pada kartu produk
             document.querySelectorAll('.product-card').forEach(card => {
                 card.addEventListener('click', function(e) {
                     if (e.target.tagName !== 'BUTTON') {
@@ -413,10 +548,12 @@ $result_produk = $koneksi->query($query_produk);
                 });
             });
 
+            // Event listener untuk tombol +/- dan "Hapus" di keranjang
             cartItemsDiv.addEventListener('click', function(e) {
                 const row = e.target.closest('.cart-item-row');
                 if (!row) return;
                 const productId = row.dataset.productId;
+
                 if (e.target.classList.contains('plus-btn')) {
                     if (cart[productId].quantity < cart[productId].stock) {
                         cart[productId].quantity++;
@@ -434,6 +571,7 @@ $result_produk = $koneksi->query($query_produk);
                 updateCartDisplay();
             });
 
+            // Event listener untuk tombol "Kosongkan"
             document.getElementById('clear-cart-btn').addEventListener('click', function() {
                 if (Object.keys(cart).length > 0 && confirm('Anda yakin ingin mengosongkan keranjang?')) {
                     cart = {};
@@ -441,6 +579,7 @@ $result_produk = $koneksi->query($query_produk);
                 }
             });
 
+            // Event listener untuk submit form
             document.getElementById('orderForm').addEventListener('submit', function(e) {
                 if (Object.keys(cart).length === 0) {
                     e.preventDefault();
@@ -448,6 +587,7 @@ $result_produk = $koneksi->query($query_produk);
                 }
             });
 
+            // Muat data dari Local Storage dan perbarui tampilan saat halaman dimuat
             loadCartFromLocalStorage();
             updateCartDisplay();
         });
